@@ -1,0 +1,60 @@
+# ------------------------
+# Python / packaging
+# ------------------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.py~ 
+*.swp
+*.egg-info/
+dist/
+build/
+eggs/
+*.egg
+pip-wheel-metadata/
+*.log
+
+# Virtualenvs
+venv/
+ENV/
+env/
+.env/
+.venv/
+venv.bak/
+venv_*/
+
+# Byte-compiled / caches
+.python-version
+
+# ------------------------
+# Secrets and config
+# ------------------------
+# local environment variables
+.env
+.env.local
+*.env
+
+# editor / IDE
+.vscode/
+.idea/
+*.sublime-workspace
+*.sublime-project
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# ------------------------
+# Jupyter / notebooks
+# ------------------------
+.ipynb_checkpoints
+*.ipynb
+*.nbconvert.ipynb
+profile_default/
+ipython_config.py
+
+# ------------------------
+# Hugging Face / model caches and large artifacts
+# ------------------------
+# HF hub cache (models, datasets, toke
