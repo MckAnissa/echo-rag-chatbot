@@ -21,17 +21,14 @@ hf_logging.set_verbosity_error()  # reduce noisy HF logs
 # ----------------------------------------------------------------------
 # HF download & behavior hints
 # ----------------------------------------------------------------------
-# Two environment toggles that help resumable downloads and avoid weird HF transfer
 os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
-# If you have flaky connections, you can set this to 0 to force legacy downloader:
-# os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "0")
 
 # ----------------------------------------------------------------------
-# Generation defaults (placeholders to be filled with tokenizer ids at runtime)
+# Generation defaults
 # ----------------------------------------------------------------------
 DEFAULT_GENERATION_KWARGS = {
-    "max_new_tokens": 200,  # Good balance of speed and completeness
+    "max_new_tokens": 200,
     "temperature": 0.7,
     "do_sample": True,
     "top_p": 0.95,
@@ -65,7 +62,6 @@ def _retry_with_backoff(func, tries=3, base_delay=1.0, exceptions=(Exception,), 
 class DocumentRetriever:
     def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
         print("Loading embedding model...")
-        # sentence-transformers returns numpy arrays; keep them that way
         self.model = SentenceTransformer(model_name)
         self.documents: List[str] = []
         self.embeddings: Optional[np.ndarray] = None
@@ -106,8 +102,12 @@ class EchoChatbot:
         print("(First run will download ~7GB – this may take several minutes)")
         print("The model will be cached for future use.\n")
 
+        # Check if CUDA is available
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Device detected: {self.device.upper()}")
+
         # ===============================================================
-        # STEP 1: Load Tokenizer FIRST (before anything references it)
+        # STEP 1: Load Tokenizer FIRST
         # ===============================================================
         def _load_tokenizer():
             return AutoTokenizer.from_pretrained(
@@ -130,7 +130,6 @@ class EchoChatbot:
             print(f"Failed to load tokenizer: {e}")
             raise
 
-        # Ensure pad token exists
         if getattr(self.tokenizer, "pad_token", None) is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
@@ -140,7 +139,7 @@ class EchoChatbot:
         # STEP 2: Set up quantization config (GPU only)
         # ===============================================================
         quantization_config = None
-        if torch.cuda.is_available():
+        if self.device == "cuda":
             try:
                 quantization_config = BitsAndBytesConfig(
                     load_in_4bit=True,
@@ -148,24 +147,36 @@ class EchoChatbot:
                     bnb_4bit_use_double_quant=True,
                     bnb_4bit_quant_type="nf4",
                 )
-                print("Using 4-bit quantisation (lower VRAM)...")
+                print("Using 4-bit quantization (lower VRAM)...")
             except Exception as e:
-                print(f"Quantisation setup failed: {e}")
+                print(f"Quantization setup failed: {e}")
 
         # ===============================================================
-        # STEP 3: Load Model
+        # STEP 3: Load Model with proper CPU/GPU handling
         # ===============================================================
         def _load_model():
-            return AutoModelForCausalLM.from_pretrained(
-                model_name,
-                torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32,
-                device_map="auto",
-                trust_remote_code=True,
-                attn_implementation="eager",
-                low_cpu_mem_usage=True,
-                quantization_config=quantization_config,
-                resume_download=True,
-            )
+            if self.device == "cpu":
+                # CPU: Load directly without device_map
+                print("Loading model for CPU (this will be slow)...")
+                return AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.float32,  # CPU uses float32
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=True,
+                    resume_download=True,
+                )
+            else:
+                # GPU: Use device_map and quantization
+                return AutoModelForCausalLM.from_pretrained(
+                    model_name,
+                    torch_dtype=torch.float16,
+                    device_map="auto",
+                    trust_remote_code=True,
+                    attn_implementation="eager",
+                    low_cpu_mem_usage=True,
+                    quantization_config=quantization_config,
+                    resume_download=True,
+                )
 
         try:
             self.model = _retry_with_backoff(
@@ -182,22 +193,23 @@ class EchoChatbot:
             print("If this is a corrupted download, clear the cached model and re-run:")
             print(
                 "   Remove-Item -Recurse -Force "
-                "~\\.cache\\huggingface\\hub\\models--microsoft--Phi-3.5-mini-instruct"
+                "~\\.cache\\huggingface\\hub\\models--microsoft--phi-2"
             )
             raise
 
-# ===============================================================
+        # Move model to device if on CPU (GPU is already handled by device_map)
+        if self.device == "cpu":
+            self.model = self.model.to(self.device)
+
+        # ===============================================================
         # STEP 4: Configure model settings
         # ===============================================================
-        # Disable caching to avoid StaticCache errors
         self.model.config.use_cache = False
         
-        # Force eager attention if available
         if hasattr(self.model.config, "attn_implementation"):
             self.model.config.attn_implementation = "eager"
 
-        device = "GPU" if torch.cuda.is_available() else "CPU"
-        print(f"Model loaded successfully! Running on: {device}\n")
+        print(f"Model loaded successfully! Running on: {self.device.upper()}\n")
 
         # ===============================================================
         # STEP 5: Set up generation parameters
@@ -205,15 +217,12 @@ class EchoChatbot:
         self.generation_kwargs = DEFAULT_GENERATION_KWARGS.copy()
         self.generation_kwargs["pad_token_id"] = self.tokenizer.eos_token_id
         self.generation_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
-        # CRITICAL: Ensure cache is disabled
         self.generation_kwargs["use_cache"] = False
         if "cache_implementation" in self.generation_kwargs:
             del self.generation_kwargs["cache_implementation"]
 
-        # Initialize conversation history
         self.conversation_history: List[str] = []
 
-    # small helper to safely move tokenizer outputs to device
     @staticmethod
     def _to_device(inputs: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
         return {k: v.to(device) for k, v in inputs.items()}
@@ -253,7 +262,6 @@ Output:"""
 
         print("Generating response...\n")
 
-        # Tokenize and move to device safely
         try:
             raw_inputs = self.tokenizer(
                 prompt,
@@ -261,23 +269,18 @@ Output:"""
                 truncation=True,
                 max_length=4096,
             )
-            device = self.model.device
-            inputs = self._to_device(raw_inputs, device)
+            inputs = self._to_device(raw_inputs, torch.device(self.device))
 
-            # Build generation kwargs that depend on inputs
             gen_kwargs = dict(self.generation_kwargs)
             gen_kwargs["max_length"] = inputs["input_ids"].shape[1] + gen_kwargs.get("max_new_tokens", 512)
 
-            # safety: ensure pad/eos ids exist
             if gen_kwargs.get("pad_token_id") is None:
                 gen_kwargs["pad_token_id"] = self.tokenizer.eos_token_id
             if gen_kwargs.get("eos_token_id") is None:
                 gen_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
 
-            # Ensure cache is disabled
             gen_kwargs["use_cache"] = False
 
-            # do generation with retries
             def _gen_call():
                 with torch.no_grad():
                     return self.model.generate(**inputs, **gen_kwargs)
@@ -291,7 +294,6 @@ Output:"""
             )
 
             full = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            # Phi-2 format extraction
             if "Output:" in full:
                 response = full.split("Output:")[-1].strip()
             else:
@@ -551,19 +553,19 @@ knowledge_base = [
 
     '''Asynchronous communication (email, messaging) enables flexibility but can create always-on expectations. Synchronous communication (calls, meetings) enables richer interaction but demands real-time availability. Each has tradeoffs.''',
 
-    '''Open source software embodies values of collaboration, transparency, and shared benefit. Proprietary software enables funding development and protecting intellectual property. Neither is inherently superior - context matters.''',
-]
+    '''Open source software embodies values of collaboration, transparency, and shared benefit. Proprietary software enables funding development and protecting intellectual property. Neither is inherently superior - context matters.''',]
 
 # ----------------------------------------------------------------------
 # Simple CLI loop
 # ----------------------------------------------------------------------
+
 def main():
     print("=" * 60)
     print("Echo - Local RAG Chatbot")
     print("=" * 60)
     print("Setting up Echo... (this may take a few minutes on first run)")
     print("\nTip: If download fails, clear cache:")
-    print("   Remove-Item -Recurse -Force ~\\.cache\\huggingface\\hub\\models--microsoft--Phi-3.5-mini-instruct\n")
+    print("   Remove-Item -Recurse -Force ~\\.cache\\huggingface\\hub\\models--microsoft--phi-2\n")
 
     try:
         bot = EchoChatbot()

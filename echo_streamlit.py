@@ -52,10 +52,9 @@ if "bot" not in st.session_state:
 if "bot_initialized" not in st.session_state:
     st.session_state.bot_initialized = False
 
-# Initialize bot
-@st.cache_resource
+# Initialize bot - FIXED VERSION (no caching initially)
 def initialize_bot():
-    """Initialize Echo chatbot (cached so it only runs once)"""
+    """Initialize Echo chatbot"""
     bot = EchoChatbot(model_name="microsoft/phi-2")
     bot.load_knowledge_base(knowledge_base)
     return bot
@@ -67,9 +66,9 @@ A locally-run RAG chatbot that thinks deeply about ethics, philosophy, technolog
 Echo has access to a curated knowledge base and engages in thoughtful, introspective conversations.
 """)
 
-# Load bot with progress indicator
+# Load bot with progress indicator - FIXED
 if not st.session_state.bot_initialized:
-    with st.spinner("🔄 Initializing Echo... This may take a minute on first run..."):
+    with st.spinner("🔄 Initializing Echo... This may take 2-5 minutes on first run..."):
         try:
             st.session_state.bot = initialize_bot()
             st.session_state.bot_initialized = True
@@ -78,6 +77,8 @@ if not st.session_state.bot_initialized:
             st.rerun()
         except Exception as e:
             st.error(f"❌ Failed to initialize Echo: {str(e)}")
+            import traceback
+            st.code(traceback.format_exc())
             st.stop()
 
 # Sidebar with info
@@ -136,6 +137,8 @@ if prompt := st.chat_input("Ask Echo anything about ethics, philosophy, technolo
             error_msg = f"❌ Sorry, I encountered an error: {str(e)}"
             message_placeholder.markdown(error_msg)
             st.session_state.messages.append({"role": "assistant", "content": error_msg})
+            import traceback
+            st.code(traceback.format_exc())
 
 # Footer
 st.divider()
