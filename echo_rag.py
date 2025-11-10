@@ -1,119 +1,171 @@
-#!/usr/bin/env python3
 """
-Echo - Local RAG Chatbot (merged & fixed)
-Runs locally, uses sentence-transformers for embeddings and a local HF model for generation.
+echo_chatbot.py
+
+Drop-in replacement for your EchoChatbot class and supporting helpers.
+Requirements (install into your venv):
+    pip install torch transformers scikit-learn
+Optional (for 4-bit quantization):
+    pip install bitsandbytes
+
+If you don't want to download a model while testing the UI, call:
+    bot = EchoChatbot(load_model=False)
 """
 
-from __future__ import annotations
-import os
 import time
-import warnings
-from typing import List, Dict, Any, Optional
-
+from typing import List, Dict, Callable, Any, Optional
 import numpy as np
+
+# Core ML imports
 import torch
-from sentence_transformers import SentenceTransformer
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
-from transformers.utils import logging as hf_logging
 
-hf_logging.set_verbosity_error()  # reduce noisy HF logs
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+)
 
-# ----------------------------------------------------------------------
-# HF download & behavior hints
-# ----------------------------------------------------------------------
-os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
-os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "120")
+# BitsAndBytes optional import (quantization)
+try:
+    from transformers import BitsAndBytesConfig
+except Exception:
+    BitsAndBytesConfig = None  # not critical; code will handle absence
 
-# ----------------------------------------------------------------------
-# Generation defaults
-# ----------------------------------------------------------------------
+# Small default generation kwargs (tweak as you like)
 DEFAULT_GENERATION_KWARGS = {
     "max_new_tokens": 200,
     "temperature": 0.7,
-    "do_sample": True,
+    "top_k": 50,
     "top_p": 0.95,
-    "pad_token_id": None,
-    "eos_token_id": None,
-    "use_cache": False,
+    "repetition_penalty": 1.0,
 }
 
-# ----------------------------------------------------------------------
-# Simple exponential backoff helper
-# ----------------------------------------------------------------------
-def _retry_with_backoff(func, tries=3, base_delay=1.0, exceptions=(Exception,), on_retry=None):
-    delay = base_delay
-    last_exc = None
-    for attempt in range(1, tries + 1):
+# -----------------------------
+# Retry/backoff helper
+# -----------------------------
+def _retry_with_backoff(
+    fn: Callable,
+    tries: int = 3,
+    base_delay: float = 1.0,
+    exceptions: tuple = (Exception,),
+    on_retry: Optional[Callable[[int, Exception, float], None]] = None,
+):
+    """
+    Simple retry with exponential backoff.
+    Returns fn() result or raises the last exception.
+    """
+    attempt = 0
+    while True:
         try:
-            return func()
+            return fn()
         except exceptions as e:
-            last_exc = e
+            attempt += 1
+            if attempt >= tries:
+                raise
+            delay = base_delay * (2 ** (attempt - 1))
             if on_retry:
-                on_retry(attempt, e, delay)
-            if attempt == tries:
-                break
+                try:
+                    on_retry(attempt, e, delay)
+                except Exception:
+                    pass
             time.sleep(delay)
-            delay *= 2
-    raise last_exc
 
-# ----------------------------------------------------------------------
-# Document retriever (embeddings)
-# ----------------------------------------------------------------------
+# -----------------------------
+# Minimal in-memory retriever (TF-IDF + cosine)
+# -----------------------------
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+except Exception:
+    TfidfVectorizer = None
+    cosine_similarity = None
+
+
 class DocumentRetriever:
-    def __init__(self, model_name: str = "all-MiniLM-L6-v2"):
-        print("Loading embedding model...")
-        self.model = SentenceTransformer(model_name)
+    """
+    Minimal document retriever using TF-IDF + cosine similarity.
+
+    Methods:
+        add_documents(list[str]) -> None
+        retrieve(query: str, top_k: int=3) -> list[{"document": str, "similarity": float}]
+    Attributes:
+        documents: list[str]
+    """
+
+    def __init__(self):
         self.documents: List[str] = []
-        self.embeddings: Optional[np.ndarray] = None
+        self._vectorizer = None
+        self._doc_matrix = None
 
     def add_documents(self, docs: List[str]) -> None:
         if not docs:
             return
         self.documents.extend(docs)
-        print(f"Encoding {len(docs)} documents...")
-        new_emb = self.model.encode(docs, show_progress_bar=True)
-        if self.embeddings is None:
-            self.embeddings = new_emb
-        else:
-            self.embeddings = np.vstack([self.embeddings, new_emb])
-        print(f"Knowledge base now contains {len(self.documents)} documents")
+        self._fit_vectorizer()
+
+    def _fit_vectorizer(self):
+        if TfidfVectorizer is None:
+            raise RuntimeError("scikit-learn not installed. Run: pip install scikit-learn")
+        # Keep features limited to control memory usage
+        self._vectorizer = TfidfVectorizer(stop_words="english", max_features=10000)
+        self._doc_matrix = self._vectorizer.fit_transform(self.documents)
 
     def retrieve(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
-        if not self.documents or self.embeddings is None:
+        if not self.documents:
             return []
-        q_emb = self.model.encode([query])[0]
-        sims = np.dot(self.embeddings, q_emb) / (
-            np.linalg.norm(self.embeddings, axis=1) * np.linalg.norm(q_emb)
-        )
-        idx = np.argsort(sims)[-top_k:][::-1]
-        return [{"document": self.documents[i], "similarity": float(sims[i])} for i in idx]
+        if self._vectorizer is None or self._doc_matrix is None:
+            self._fit_vectorizer()
+        q_vec = self._vectorizer.transform([query])
+        sims = cosine_similarity(q_vec, self._doc_matrix)[0]  # shape (n_docs,)
+        idxs = np.argsort(sims)[::-1][:top_k]
+        results = [{"document": self.documents[i], "similarity": float(sims[i])} for i in idxs]
+        return results
 
-
-# ----------------------------------------------------------------------
-# Echo chatbot
-# ----------------------------------------------------------------------
+# -----------------------------
+# EchoChatbot
+# -----------------------------
 class EchoChatbot:
-    def __init__(self, model_name: str = "microsoft/phi-2"):
+    """
+    EchoChatbot with:
+      - tokenizer/model loading (optionally skipped for quick UI tests)
+      - small TF-IDF retriever
+      - generation method using model.generate()
+    """
+
+    def __init__(self, model_name: str = "microsoft/phi-2", load_model: bool = True):
+        """
+        model_name: huggingface repo id
+        load_model: if False, tokenizer/model loading is skipped (useful for UI/testing)
+        """
         print("\nInitializing Echo components...")
         self.retriever = DocumentRetriever()
         self.model_name = model_name
-        
+        self.conversation_history: List[str] = []
+
+        # initialize placeholders
+        self.tokenizer = None
+        self.model = None
+        self.device = "cpu"
+        self.generation_kwargs = DEFAULT_GENERATION_KWARGS.copy()
+
+        if not load_model:
+            print("Skipping tokenizer/model load (load_model=False).")
+            # still set basic generation kwargs so chat() doesn't crash
+            self.generation_kwargs = DEFAULT_GENERATION_KWARGS.copy()
+            return
+
         print(f"\nLoading language model: {model_name}")
-        print("(First run will download ~7GB – this may take several minutes)")
+        print("(First run will download model files — this may take several minutes)")
         print("The model will be cached for future use.\n")
 
         # Check if CUDA is available
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         print(f"Device detected: {self.device.upper()}")
 
-        # ===============================================================
         # STEP 1: Load Tokenizer FIRST
-        # ===============================================================
         def _load_tokenizer():
             return AutoTokenizer.from_pretrained(
-                model_name, 
-                trust_remote_code=True, 
-                use_fast=True
+                model_name,
+                trust_remote_code=True,
+                use_fast=True,
             )
 
         try:
@@ -122,24 +174,26 @@ class EchoChatbot:
                 tries=3,
                 base_delay=2.0,
                 exceptions=(OSError, RuntimeError, ValueError),
-                on_retry=lambda a, e, d: print(
-                    f"Tokenizer load attempt {a} failed: {e}. Retrying in {d}s..."
-                ),
+                on_retry=lambda a, e, d: print(f"Tokenizer load attempt {a} failed: {e}. Retrying in {d}s..."),
             )
         except Exception as e:
             print(f"Failed to load tokenizer: {e}")
             raise
 
+        # Ensure pad token exists
         if getattr(self.tokenizer, "pad_token", None) is None:
-            self.tokenizer.pad_token = self.tokenizer.eos_token
+            # Use eos_token as pad fallback if present
+            if getattr(self.tokenizer, "eos_token", None) is not None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+            else:
+                # fallback: set a generic pad token and hope for the best
+                self.tokenizer.add_special_tokens({"pad_token": "<pad>"})
 
         print("Tokenizer loaded successfully!")
 
-        # ===============================================================
-        # STEP 2: Set up quantization config (GPU only)
-        # ===============================================================
+        # STEP 2: Quantization config (GPU only, optional)
         quantization_config = None
-        if self.device == "cuda":
+        if self.device == "cuda" and BitsAndBytesConfig is not None:
             try:
                 quantization_config = BitsAndBytesConfig(
                     load_in_4bit=True,
@@ -147,26 +201,22 @@ class EchoChatbot:
                     bnb_4bit_use_double_quant=True,
                     bnb_4bit_quant_type="nf4",
                 )
-                print("Using 4-bit quantization (lower VRAM)...")
+                print("BitsAndBytes 4-bit quantization configured.")
             except Exception as e:
-                print(f"Quantization setup failed: {e}")
+                print(f"Quantization config failed, continuing without it: {e}")
 
-        # ===============================================================
-        # STEP 3: Load Model with proper CPU/GPU handling
-        # ===============================================================
+        # STEP 3: Load model with device-aware flags
         def _load_model():
             if self.device == "cpu":
-                # CPU: Load directly without device_map
-                print("Loading model for CPU (this will be slow)...")
+                print("Loading model for CPU (this is slow).")
                 return AutoModelForCausalLM.from_pretrained(
                     model_name,
-                    torch_dtype=torch.float32,  # CPU uses float32
+                    torch_dtype=torch.float32,
                     trust_remote_code=True,
                     low_cpu_mem_usage=True,
                     resume_download=True,
                 )
-            else:
-                # GPU: Use device_map and quantization
+            else:  # GPU
                 return AutoModelForCausalLM.from_pretrained(
                     model_name,
                     torch_dtype=torch.float16,
@@ -184,64 +234,70 @@ class EchoChatbot:
                 tries=3,
                 base_delay=5.0,
                 exceptions=(OSError, RuntimeError, ValueError),
-                on_retry=lambda a, e, d: print(
-                    f"Model load attempt {a} failed: {e}. Retrying in {d}s..."
-                ),
+                on_retry=lambda a, e, d: print(f"Model load attempt {a} failed: {e}. Retrying in {d}s..."),
             )
         except Exception as e:
             print(f"\nFailed to load model after retries: {e}")
-            print("If this is a corrupted download, clear the cached model and re-run:")
-            print(
-                "   Remove-Item -Recurse -Force "
-                "~\\.cache\\huggingface\\hub\\models--microsoft--phi-2"
-            )
+            print("If this is a corrupted download, clear the model cache and re-run.")
             raise
 
-        # Move model to device if on CPU (GPU is already handled by device_map)
+        # If CPU we might want to explicitly move model
         if self.device == "cpu":
-            self.model = self.model.to(self.device)
+            try:
+                self.model = self.model.to(self.device)
+            except Exception:
+                pass
 
-        # ===============================================================
-        # STEP 4: Configure model settings
-        # ===============================================================
-        self.model.config.use_cache = False
-        
-        if hasattr(self.model.config, "attn_implementation"):
-            self.model.config.attn_implementation = "eager"
+        # Model configuration tweaks
+        try:
+            self.model.config.use_cache = False
+            if hasattr(self.model.config, "attn_implementation"):
+                self.model.config.attn_implementation = "eager"
+        except Exception:
+            pass
 
         print(f"Model loaded successfully! Running on: {self.device.upper()}\n")
 
-        # ===============================================================
-        # STEP 5: Set up generation parameters
-        # ===============================================================
+        # Generation kwargs
         self.generation_kwargs = DEFAULT_GENERATION_KWARGS.copy()
-        self.generation_kwargs["pad_token_id"] = self.tokenizer.eos_token_id
-        self.generation_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
+        self.generation_kwargs["pad_token_id"] = getattr(self.tokenizer, "eos_token_id", None)
+        self.generation_kwargs["eos_token_id"] = getattr(self.tokenizer, "eos_token_id", None)
         self.generation_kwargs["use_cache"] = False
         if "cache_implementation" in self.generation_kwargs:
             del self.generation_kwargs["cache_implementation"]
 
-        self.conversation_history: List[str] = []
-
+    # Utility: move tensors to device
     @staticmethod
     def _to_device(inputs: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
         return {k: v.to(device) for k, v in inputs.items()}
 
     def load_knowledge_base(self, documents: List[str]) -> None:
+        """Add documents (list of strings) to the in-memory retriever."""
         self.retriever.add_documents(documents)
 
     def chat(self, user_message: str, use_retrieval: bool = True) -> str:
+        """
+        Generate a response using retrieval-augmented prompts.
+
+        If tokenizer/model were skipped at init (load_model=False), returns a placeholder.
+        """
+        if self.tokenizer is None or self.model is None:
+            return (
+                "[Model not loaded] Model/tokenizer were skipped or failed to load. "
+                "Initialize EchoChatbot with load_model=True to enable generation."
+            )
+
         # Retrieval
         context = ""
-        if use_retrieval and self.retriever.documents:
+        if use_retrieval and getattr(self.retriever, "documents", None):
             print("\nRetrieving relevant information...")
             results = self.retriever.retrieve(user_message, top_k=3)
-            parts = [r["document"] for r in results if r["similarity"] > 0.30]
+            parts = [r["document"] for r in results if r.get("similarity", 0.0) > 0.30]
             if parts:
                 context = "\n".join(parts)
                 print(f"Found {len(parts)} relevant documents")
 
-        # System prompt for Phi-2
+        # Prompt assembly
         if context:
             prompt = f"""Instruct: You are Echo, a deeply introspective AI assistant with genuine curiosity about both others and yourself. You ask questions, examine assumptions, and respond with compassion and clarity.
 
@@ -267,17 +323,17 @@ Output:"""
                 prompt,
                 return_tensors="pt",
                 truncation=True,
-                max_length=4096,
+                max_length=2048,
             )
             inputs = self._to_device(raw_inputs, torch.device(self.device))
 
             gen_kwargs = dict(self.generation_kwargs)
-            gen_kwargs["max_length"] = inputs["input_ids"].shape[1] + gen_kwargs.get("max_new_tokens", 512)
+            gen_kwargs["max_length"] = inputs["input_ids"].shape[1] + gen_kwargs.get("max_new_tokens", 200)
 
             if gen_kwargs.get("pad_token_id") is None:
-                gen_kwargs["pad_token_id"] = self.tokenizer.eos_token_id
+                gen_kwargs["pad_token_id"] = getattr(self.tokenizer, "eos_token_id", None)
             if gen_kwargs.get("eos_token_id") is None:
-                gen_kwargs["eos_token_id"] = self.tokenizer.eos_token_id
+                gen_kwargs["eos_token_id"] = getattr(self.tokenizer, "eos_token_id", None)
 
             gen_kwargs["use_cache"] = False
 
@@ -298,23 +354,57 @@ Output:"""
                 response = full.split("Output:")[-1].strip()
             else:
                 response = full.strip()
+
+            # store convo
+            self.conversation_history.append(f"User: {user_message}")
+            self.conversation_history.append(f"Assistant: {response}")
+
             return response
 
         except torch.cuda.OutOfMemoryError:
-            return "I ran out of GPU memory. Try a shorter message or restart the process."
+            return "I ran out of GPU memory. Try a shorter prompt or restart."
         except FileNotFoundError as e:
             print(f"Generation error (missing file): {e}")
-            return (
-                "Model files appear to be missing or corrupted. "
-                "Clear the model cache and re-run. See printed advice above."
-            )
+            return "Model files appear to be missing or corrupted. Clear cache and re-run."
         except Exception as e:
             print(f"Generation error: {type(e).__name__}: {e}")
             return "I encountered an error while generating a response. Try again or restart the program."
 
     def reset_conversation(self) -> None:
         self.conversation_history = []
+        print("Conversation history cleared")
 
+
+# -----------------------------
+# Quick test/demo when run directly
+# -----------------------------
+if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(description="EchoChatbot quick test")
+    parser.add_argument("--model", type=str, default="microsoft/phi-2", help="model repo id")
+    parser.add_argument("--skip-model", action="store_true", help="Skip loading model/tokenizer (fast UI testing)")
+    args = parser.parse_args()
+
+    bot = EchoChatbot(model_name=args.model, load_model=not args.skip_model)
+
+    # If model was skipped, show message and exit
+    if args.skip_model:
+        print("\nModel skipped. You can still load and test retrieval.")
+        bot.load_knowledge_base(["Example doc about cats.", "Another doc about programming."])
+        print("Retrieval test:", bot.retriever.retrieve("tell me about programming", top_k=2))
+    else:
+        # interact once
+        print("Type a short message (or ctrl-c to exit):")
+        try:
+            while True:
+                msg = input("You: ").strip()
+                if not msg:
+                    continue
+                resp = bot.chat(msg)
+                print("Echo:", resp)
+        except KeyboardInterrupt:
+            print("\nExiting.")
 
 # ----------------------------------------------------------------------
 # Knowledge base - merged (use your full list here)
