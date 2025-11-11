@@ -15,7 +15,7 @@ Usage:
     streamlit run echo_streamlit.py
 """
 
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, TYPE_CHECKING
 import sys
 import os
 import time
@@ -34,6 +34,12 @@ except Exception as e:
     import_error_for_echo = e
 else:
     import_error_for_echo = None
+
+# Type checking import
+if TYPE_CHECKING:
+    from echo_rag import EchoChatbot as EchoChatbotType
+else:
+    EchoChatbotType = None
 
 # -----------------------------
 # Configuration constants
@@ -112,7 +118,7 @@ def poll_server_status(timeout: int = 600, poll_interval: float = 1.0) -> Dict[s
 # Cached factory for local chatbot
 # -----------------------------
 @st.cache_resource
-def get_chatbot_local(model_name: str, load_model: bool = True) -> Optional[EchoChatbot]:
+def get_chatbot_local(model_name: str, load_model: bool = True):
     """
     Returns an EchoChatbot instance cached by Streamlit.
     If load_model=False, an instance is created that skips heavy loading (EchoChatbot must support load_model flag).
@@ -189,7 +195,7 @@ with st.sidebar:
                         st.info("Model load was skipped. Add docs and test retrieval. Click the 'Load Model' button in sidebar to load the actual model.")
                     else:
                         st.info("Model/tokenizer loaded (this may have taken a while).")
-                    st.experimental_rerun()
+                    st.rerun()
                 except Exception as e:
                     st.error(f"Failed to initialize local Echo: {e}")
         else:
@@ -205,7 +211,7 @@ with st.sidebar:
                     try:
                         st.session_state.chatbot = get_chatbot_local(model_name=model_name, load_model=True)
                         st.success("Model loaded locally.")
-                        st.experimental_rerun()
+                        st.rerun()
                     except Exception as e:
                         st.error(f"Failed to load model locally: {e}")
 
@@ -259,7 +265,7 @@ with st.sidebar:
                                 st.success("Server model is ready now.")
                                 st.session_state.initialized = True
                                 st.session_state.chatbot = {"server_mode": True}
-                                st.experimental_rerun()
+                                st.rerun()
                             else:
                                 st.error("Polling timed out or failed.")
                 else:
@@ -316,7 +322,7 @@ with st.sidebar:
                 st.session_state.chatbot.reset_conversation()
             except Exception:
                 pass
-        st.experimental_rerun()
+        st.rerun()
 
 # -----------------------------
 # Main content area
@@ -397,7 +403,7 @@ else:
                         response = bot.chat(prompt, use_retrieval=use_retrieval)
                 st.session_state.messages.append({"role": "assistant", "content": response})
                 # Rerun so the UI updates (Streamlit shows appended messages on rerun)
-                st.experimental_rerun()
+                st.rerun()
             except Exception as e:
                 st.error(f"Error generating response: {e}")
 
