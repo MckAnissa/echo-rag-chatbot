@@ -1,14 +1,21 @@
 """
-echo_chatbot.py
+# 🧠 Echo — Your Introspective AI Companion
 
-Drop-in replacement for your EchoChatbot class and supporting helpers.
-Requirements (install into your venv):
-    pip install torch transformers scikit-learn
-Optional (for 4-bit quantization):
-    pip install bitsandbytes
+![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)
+![License](https://img.shields.io/badge/license-MIT-green.svg)
+![Streamlit](https://img.shields.io/badge/streamlit-1.28+-FF4B4B.svg)
+![PyTorch](https://img.shields.io/badge/pytorch-2.0+-EE4C2C.svg)
 
-If you don't want to download a model while testing the UI, call:
-    bot = EchoChatbot(load_model=False)
+> **A personal ML engineering project demonstrating RAG implementation, local LLM deployment, and full-stack AI application development.**
+
+Echo is a privacy-first conversational AI that runs entirely on your local machine. No cloud services, no API costs, no data collection—just a thoughtful AI companion powered by Phi-2 and retrieval-augmented generation.
+
+**What makes this project interesting:**
+- Implements RAG from scratch using TF-IDF retrieval (no vector DB dependencies)
+- Optimizes 2.7B parameter model (Phi-2) to run on CPU without GPU
+- Builds production-ready UI with Streamlit including session management and caching
+- Includes FastAPI model server option for async inference
+- Demonstrates software engineering best practices (error handling, retry logic, modular design)
 """
 
 import time
