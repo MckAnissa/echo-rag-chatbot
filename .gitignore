@@ -58,3 +58,8 @@ ipython_config.py
 # Hugging Face / model caches and large artifacts
 # ------------------------
 # HF hub cache (models, datasets, toke
+
+# Model cache and Python artifacts
+__pycache__/
+*.pyc
+.pytest_cache/
