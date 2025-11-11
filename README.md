@@ -9,7 +9,7 @@
 
 > **A personal ML engineering project demonstrating RAG implementation, local LLM deployment, and full-stack AI application development.**
 
-Echo is a privacy-first conversational AI that runs entirely on your local machine. No cloud services, no API costs, no data collection—just a thoughtful AI companion powered by Phi-2 and retrieval-augmented generation.
+Echo is a privacy-first conversational AI that runs entirely on your local machine. No cloud services, no API costs, and no data collection. Thoughtful AI companion powered by Phi-2 and retrieval-augmented generation.
 
 **What makes this project interesting:**
 - Implements RAG from scratch using TF-IDF retrieval (no vector DB dependencies)
