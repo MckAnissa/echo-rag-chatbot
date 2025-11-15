@@ -1,6 +1,11 @@
-# ------------------------
-# Python / packaging
-# ------------------------
+# Model files - DO NOT commit (too large for Git)
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# Python
 __pycache__/
 *.py[cod]
 *.pyo
@@ -14,8 +19,9 @@ eggs/
 *.egg
 pip-wheel-metadata/
 *.log
+.python-version
 
-# Virtualenvs
+# Virtual environments
 venv/
 ENV/
 env/
@@ -24,18 +30,12 @@ env/
 venv.bak/
 venv_*/
 
-# Byte-compiled / caches
-.python-version
-
-# ------------------------
 # Secrets and config
-# ------------------------
-# local environment variables
 .env
 .env.local
 *.env
 
-# editor / IDE
+# IDE
 .vscode/
 .idea/
 *.sublime-workspace
@@ -45,21 +45,32 @@ venv_*/
 .DS_Store
 Thumbs.db
 
-# ------------------------
-# Jupyter / notebooks
-# ------------------------
+# Jupyter
 .ipynb_checkpoints
 *.ipynb
 *.nbconvert.ipynb
 profile_default/
 ipython_config.py
 
-# ------------------------
-# Hugging Face / model caches and large artifacts
-# ------------------------
-# HF hub cache (models, datasets, toke
+# Hugging Face cache
+.cache/
+huggingface/
 
-# Model cache and Python artifacts
-__pycache__/
-*.pyc
+# Model cache
+models/
+*.model
+
+# Conversation memory
+echo_memory.json
+
+# Streamlit
+.streamlit/
+
+# Testing
 .pytest_cache/
+.coverage
+htmlcov/
+
+# Logs
+*.log
+logs/

@@ -1,49 +1,27 @@
-"""
-# 🧠 Echo — Your Introspective AI Companion
-
-![Python Version](https://img.shields.io/badge/python-3.8+-blue.svg)
-![License](https://img.shields.io/badge/license-MIT-green.svg)
-![Streamlit](https://img.shields.io/badge/streamlit-1.28+-FF4B4B.svg)
-![PyTorch](https://img.shields.io/badge/pytorch-2.0+-EE4C2C.svg)
-
-> **A personal ML engineering project demonstrating RAG implementation, local LLM deployment, and full-stack AI application development.**
-
-Echo is a privacy-first conversational AI that runs entirely on your local machine. No cloud services, no API costs, no data collection—just a thoughtful AI companion powered by Phi-2 and retrieval-augmented generation.
-
-**What makes this project interesting:**
-- Implements RAG from scratch using TF-IDF retrieval (no vector DB dependencies)
-- Optimizes 2.7B parameter model (Phi-2) to run on CPU without GPU
-- Builds production-ready UI with Streamlit including session management and caching
-- Includes FastAPI model server option for async inference
-- Demonstrates software engineering best practices (error handling, retry logic, modular design)
-"""
+# echo_llama_only.py
+# Minimal Echo chatbot using llama-cpp-python + GGUF
+# FIXED: Added proper stopping criteria to prevent runaway generation
 
 import time
-from typing import List, Dict, Callable, Any, Optional
+import json
 import numpy as np
+from typing import List, Dict, Callable, Any, Optional
+from pathlib import Path
+from datetime import datetime
+import os
 
-# Core ML imports
-import torch
-
-from transformers import (
-    AutoTokenizer,
-    AutoModelForCausalLM,
-)
-
-# BitsAndBytes optional import (quantization)
+# Prefer llama.cpp for GGUF CPU inference
 try:
-    from transformers import BitsAndBytesConfig
+    from llama_cpp import Llama
+    HAS_LLAMA_CPP = True
 except Exception:
-    BitsAndBytesConfig = None  # not critical; code will handle absence
+    Llama = None
+    HAS_LLAMA_CPP = False
 
-# Small default generation kwargs (tweak as you like)
-DEFAULT_GENERATION_KWARGS = {
-    "max_new_tokens": 200,
-    "temperature": 0.7,
-    "top_k": 50,
-    "top_p": 0.95,
-    "repetition_penalty": 1.0,
-}
+# Torch kept only for thread tuning (not for model)
+import torch
+torch.set_num_threads(4)
+torch.set_num_interop_threads(1)
 
 # -----------------------------
 # Retry/backoff helper
@@ -55,10 +33,6 @@ def _retry_with_backoff(
     exceptions: tuple = (Exception,),
     on_retry: Optional[Callable[[int, Exception, float], None]] = None,
 ):
-    """
-    Simple retry with exponential backoff.
-    Returns fn() result or raises the last exception.
-    """
     attempt = 0
     while True:
         try:
@@ -81,340 +55,149 @@ def _retry_with_backoff(
 try:
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.metrics.pairwise import cosine_similarity
+    SKLEARN_AVAILABLE = True
 except Exception:
     TfidfVectorizer = None
     cosine_similarity = None
+    SKLEARN_AVAILABLE = False
 
 
 class DocumentRetriever:
-    """
-    Minimal document retriever using TF-IDF + cosine similarity.
-
-    Methods:
-        add_documents(list[str]) -> None
-        retrieve(query: str, top_k: int=3) -> list[{"document": str, "similarity": float}]
-    Attributes:
-        documents: list[str]
-    """
-
     def __init__(self):
         self.documents: List[str] = []
         self._vectorizer = None
         self._doc_matrix = None
+        self._dirty = False
 
     def add_documents(self, docs: List[str]) -> None:
         if not docs:
             return
         self.documents.extend(docs)
-        self._fit_vectorizer()
+        self._dirty = True
 
     def _fit_vectorizer(self):
-        if TfidfVectorizer is None:
+        if not SKLEARN_AVAILABLE:
             raise RuntimeError("scikit-learn not installed. Run: pip install scikit-learn")
+        if not self._dirty and self._vectorizer is not None:
+            return
         # Keep features limited to control memory usage
         self._vectorizer = TfidfVectorizer(stop_words="english", max_features=10000)
         self._doc_matrix = self._vectorizer.fit_transform(self.documents)
+        self._dirty = False
 
     def retrieve(self, query: str, top_k: int = 3) -> List[Dict[str, Any]]:
         if not self.documents:
             return []
-        if self._vectorizer is None or self._doc_matrix is None:
-            self._fit_vectorizer()
-        q_vec = self._vectorizer.transform([query])
-        sims = cosine_similarity(q_vec, self._doc_matrix)[0]  # shape (n_docs,)
-        idxs = np.argsort(sims)[::-1][:top_k]
-        results = [{"document": self.documents[i], "similarity": float(sims[i])} for i in idxs]
-        return results
-
-# -----------------------------
-# EchoChatbot
-# -----------------------------
-class EchoChatbot:
-    """
-    EchoChatbot with:
-      - tokenizer/model loading (optionally skipped for quick UI tests)
-      - small TF-IDF retriever
-      - generation method using model.generate()
-    """
-
-    def __init__(self, model_name: str = "microsoft/phi-2", load_model: bool = True):
-        """
-        model_name: huggingface repo id
-        load_model: if False, tokenizer/model loading is skipped (useful for UI/testing)
-        """
-        print("\nInitializing Echo components...")
-        self.retriever = DocumentRetriever()
-        self.model_name = model_name
-        self.conversation_history: List[str] = []
-
-        # initialize placeholders
-        self.tokenizer = None
-        self.model = None
-        self.device = "cpu"
-        self.generation_kwargs = DEFAULT_GENERATION_KWARGS.copy()
-
-        if not load_model:
-            print("Skipping tokenizer/model load (load_model=False).")
-            # still set basic generation kwargs so chat() doesn't crash
-            self.generation_kwargs = DEFAULT_GENERATION_KWARGS.copy()
-            return
-
-        print(f"\nLoading language model: {model_name}")
-        print("(First run will download model files — this may take several minutes)")
-        print("The model will be cached for future use.\n")
-
-        # Check if CUDA is available
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Device detected: {self.device.upper()}")
-
-        # STEP 1: Load Tokenizer FIRST
-        def _load_tokenizer():
-            return AutoTokenizer.from_pretrained(
-                model_name,
-                trust_remote_code=True,
-                use_fast=True,
-            )
-
-        try:
-            self.tokenizer = _retry_with_backoff(
-                _load_tokenizer,
-                tries=3,
-                base_delay=2.0,
-                exceptions=(OSError, RuntimeError, ValueError),
-                on_retry=lambda a, e, d: print(f"Tokenizer load attempt {a} failed: {e}. Retrying in {d}s..."),
-            )
-        except Exception as e:
-            print(f"Failed to load tokenizer: {e}")
-            raise
-
-        # Ensure pad token exists
-        if getattr(self.tokenizer, "pad_token", None) is None:
-            # Use eos_token as pad fallback if present
-            if getattr(self.tokenizer, "eos_token", None) is not None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-            else:
-                # fallback: set a generic pad token and hope for the best
-                self.tokenizer.add_special_tokens({"pad_token": "<pad>"})
-
-        print("Tokenizer loaded successfully!")
-
-        # STEP 2: Quantization config (GPU only, optional)
-        quantization_config = None
-        if self.device == "cuda" and BitsAndBytesConfig is not None:
-            try:
-                quantization_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.float16,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4",
-                )
-                print("BitsAndBytes 4-bit quantization configured.")
-            except Exception as e:
-                print(f"Quantization config failed, continuing without it: {e}")
-
-        # STEP 3: Load model with device-aware flags
-        def _load_model():
-            if self.device == "cpu":
-                print("Loading model for CPU (this is slow).")
-                return AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    torch_dtype=torch.float32,
-                    trust_remote_code=True,
-                    low_cpu_mem_usage=True,
-                    resume_download=True,
-                )
-            else:  # GPU
-                return AutoModelForCausalLM.from_pretrained(
-                    model_name,
-                    torch_dtype=torch.float16,
-                    device_map="auto",
-                    trust_remote_code=True,
-                    attn_implementation="eager",
-                    low_cpu_mem_usage=True,
-                    quantization_config=quantization_config,
-                    resume_download=True,
-                )
-
-        try:
-            self.model = _retry_with_backoff(
-                _load_model,
-                tries=3,
-                base_delay=5.0,
-                exceptions=(OSError, RuntimeError, ValueError),
-                on_retry=lambda a, e, d: print(f"Model load attempt {a} failed: {e}. Retrying in {d}s..."),
-            )
-        except Exception as e:
-            print(f"\nFailed to load model after retries: {e}")
-            print("If this is a corrupted download, clear the model cache and re-run.")
-            raise
-
-        # If CPU we might want to explicitly move model
-        if self.device == "cpu":
-            try:
-                self.model = self.model.to(self.device)
-            except Exception:
-                pass
-
-        # Model configuration tweaks
-        try:
-            self.model.config.use_cache = False
-            if hasattr(self.model.config, "attn_implementation"):
-                self.model.config.attn_implementation = "eager"
-        except Exception:
-            pass
-
-        print(f"Model loaded successfully! Running on: {self.device.upper()}\n")
-
-        # Generation kwargs
-        self.generation_kwargs = DEFAULT_GENERATION_KWARGS.copy()
-        self.generation_kwargs["pad_token_id"] = getattr(self.tokenizer, "eos_token_id", None)
-        self.generation_kwargs["eos_token_id"] = getattr(self.tokenizer, "eos_token_id", None)
-        self.generation_kwargs["use_cache"] = False
-        if "cache_implementation" in self.generation_kwargs:
-            del self.generation_kwargs["cache_implementation"]
-
-    # Utility: move tensors to device
-    @staticmethod
-    def _to_device(inputs: Dict[str, torch.Tensor], device: torch.device) -> Dict[str, torch.Tensor]:
-        return {k: v.to(device) for k, v in inputs.items()}
-
-    def load_knowledge_base(self, documents: List[str]) -> None:
-        """Add documents (list of strings) to the in-memory retriever."""
-        self.retriever.add_documents(documents)
-
-    def chat(self, user_message: str, use_retrieval: bool = True) -> str:
-        """
-        Generate a response using retrieval-augmented prompts.
-
-        If tokenizer/model were skipped at init (load_model=False), returns a placeholder.
-        """
-        if self.tokenizer is None or self.model is None:
-            return (
-                "[Model not loaded] Model/tokenizer were skipped or failed to load. "
-                "Initialize EchoChatbot with load_model=True to enable generation."
-            )
-
-        # Retrieval
-        context = ""
-        if use_retrieval and getattr(self.retriever, "documents", None):
-            print("\nRetrieving relevant information...")
-            results = self.retriever.retrieve(user_message, top_k=3)
-            parts = [r["document"] for r in results if r.get("similarity", 0.0) > 0.30]
-            if parts:
-                context = "\n".join(parts)
-                print(f"Found {len(parts)} relevant documents")
-
-        # Prompt assembly
-        if context:
-            prompt = f"""Instruct: You are Echo, a deeply introspective AI assistant with genuine curiosity about both others and yourself. You ask questions, examine assumptions, and respond with compassion and clarity.
-
-You have access to relevant information from your knowledge base:
-{context}
-
-Use this to inform your response, but remember you're having a conversation, not just retrieving facts.
-
-User: {user_message}
-Output:"""
+        if SKLEARN_AVAILABLE:
+            if self._vectorizer is None or self._doc_matrix is None or self._dirty:
+                self._fit_vectorizer()
+            q_vec = self._vectorizer.transform([query])
+            sims = cosine_similarity(q_vec, self._doc_matrix)[0]
+            idxs = np.argsort(sims)[::-1][:top_k]
+            results = [{"document": self.documents[i], "similarity": float(sims[i])} for i in idxs]
+            return results
         else:
-            prompt = f"""Instruct: You are Echo, a deeply introspective AI assistant with genuine curiosity about both others and yourself. You ask questions, examine assumptions, and respond with compassion and clarity.
+            # fallback: simple substring match scoring
+            scores = []
+            q = query.lower()
+            for doc in self.documents:
+                score = q.count(" ") + (1 if q in doc.lower() else 0)
+                scores.append(score)
+            idxs = np.argsort(scores)[::-1][:top_k]
+            results = [{"document": self.documents[i], "similarity": float(scores[i])} for i in idxs]
+            return results
 
-You don't have specific knowledge base information for this query, but engage thoughtfully with your general understanding.
+# -----------------------------
+# Conversation memory
+# -----------------------------
+class ConversationMemory:
+    def __init__(
+        self,
+        storage_path: str = "echo_memory.json",
+        max_recent_exchanges: int = 10,
+    ):
+        self.storage_path = Path(storage_path)
+        self.max_recent_exchanges = max_recent_exchanges
+        self.data = self._load_or_initialize()
 
-User: {user_message}
-Output:"""
+    def _load_or_initialize(self) -> Dict:
+        if self.storage_path.exists():
+            try:
+                with open(self.storage_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                print(f"Loaded conversation history from {self.storage_path}")
+                return data
+            except Exception as e:
+                print(f"Error loading memory: {e}. Starting fresh.")
+        return {"summaries": [], "recent_exchanges": []}
 
-        print("Generating response...\n")
-
+    def _save(self):
         try:
-            raw_inputs = self.tokenizer(
-                prompt,
-                return_tensors="pt",
-                truncation=True,
-                max_length=2048,
-            )
-            inputs = self._to_device(raw_inputs, torch.device(self.device))
-
-            gen_kwargs = dict(self.generation_kwargs)
-            gen_kwargs["max_length"] = inputs["input_ids"].shape[1] + gen_kwargs.get("max_new_tokens", 200)
-
-            if gen_kwargs.get("pad_token_id") is None:
-                gen_kwargs["pad_token_id"] = getattr(self.tokenizer, "eos_token_id", None)
-            if gen_kwargs.get("eos_token_id") is None:
-                gen_kwargs["eos_token_id"] = getattr(self.tokenizer, "eos_token_id", None)
-
-            gen_kwargs["use_cache"] = False
-
-            def _gen_call():
-                with torch.no_grad():
-                    return self.model.generate(**inputs, **gen_kwargs)
-
-            outputs = _retry_with_backoff(
-                _gen_call,
-                tries=3,
-                base_delay=1.5,
-                exceptions=(RuntimeError, OSError, ValueError),
-                on_retry=lambda a, e, d: print(f"Generation attempt {a} failed: {e}. Retrying in {d}s..."),
-            )
-
-            full = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
-            if "Output:" in full:
-                response = full.split("Output:")[-1].strip()
-            else:
-                response = full.strip()
-
-            # store convo
-            self.conversation_history.append(f"User: {user_message}")
-            self.conversation_history.append(f"Assistant: {response}")
-
-            return response
-
-        except torch.cuda.OutOfMemoryError:
-            return "I ran out of GPU memory. Try a shorter prompt or restart."
-        except FileNotFoundError as e:
-            print(f"Generation error (missing file): {e}")
-            return "Model files appear to be missing or corrupted. Clear cache and re-run."
+            with open(self.storage_path, 'w', encoding='utf-8') as f:
+                json.dump(self.data, f, indent=2, ensure_ascii=False)
         except Exception as e:
-            print(f"Generation error: {type(e).__name__}: {e}")
-            return "I encountered an error while generating a response. Try again or restart the program."
+            print(f"Error saving memory: {e}")
 
-    def reset_conversation(self) -> None:
-        self.conversation_history = []
-        print("Conversation history cleared")
+    def add_exchange(self, user_message: str, assistant_response: str):
+        timestamp = datetime.now().isoformat()
+        self.data["recent_exchanges"].append({"role": "user", "content": user_message, "timestamp": timestamp})
+        self.data["recent_exchanges"].append({"role": "assistant", "content": assistant_response, "timestamp": timestamp})
+        if len(self.data["recent_exchanges"]) > self.max_recent_exchanges * 2:
+            self._compress_old_exchanges()
+        self._save()
 
+    def _compress_old_exchanges(self):
+        keep_count = self.max_recent_exchanges * 2
+        to_summarize = self.data["recent_exchanges"][:-keep_count]
+        self.data["recent_exchanges"] = self.data["recent_exchanges"][-keep_count:]
+        if not to_summarize:
+            return
+        summary_text = self._create_summary(to_summarize)
+        self.data["summaries"].append(summary_text)
+        print(f"Compressed {len(to_summarize)} old messages into summary")
 
-# -----------------------------
-# Quick test/demo when run directly
-# -----------------------------
-if __name__ == "__main__":
-    import argparse
+    def _create_summary(self, exchanges: List[Dict]) -> str:
+        user_messages = [ex["content"] for ex in exchanges if ex["role"] == "user"]
+        summary = f"Previous conversation covered: {len(exchanges)//2} exchanges about topics including: "
+        topics = [msg[:100] + "..." if len(msg) > 100 else msg for msg in user_messages[:5]]
+        summary += "; ".join(topics)
+        return summary
 
-    parser = argparse.ArgumentParser(description="EchoChatbot quick test")
-    parser.add_argument("--model", type=str, default="microsoft/phi-2", help="model repo id")
-    parser.add_argument("--skip-model", action="store_true", help="Skip loading model/tokenizer (fast UI testing)")
-    args = parser.parse_args()
+    def get_context_for_prompt(self, max_chars: int = 4000) -> str:
+        context_parts = []
+        if self.data["summaries"]:
+            context_parts.append("## Previous Conversation Summary:")
+            context_parts.extend(self.data["summaries"])
+            context_parts.append("")
+        if self.data["recent_exchanges"]:
+            context_parts.append("## Recent Conversation:")
+            for ex in self.data["recent_exchanges"]:
+                role = ex["role"].title()
+                content = ex["content"]
+                context_parts.append(f"{role}: {content}")
+            context_parts.append("")
+        full_context = "\n".join(context_parts)
+        # keep by characters to avoid tokenization dependency
+        if len(full_context) > max_chars:
+            # return last portion
+            return full_context[-max_chars:]
+        return full_context
 
-    bot = EchoChatbot(model_name=args.model, load_model=not args.skip_model)
+    def get_all_exchanges_for_rag(self) -> List[str]:
+        documents = []
+        documents.extend(self.data["summaries"])
+        for ex in self.data["recent_exchanges"]:
+            doc = f"{ex['role'].title()}: {ex['content']}"
+            documents.append(doc)
+        return documents
 
-    # If model was skipped, show message and exit
-    if args.skip_model:
-        print("\nModel skipped. You can still load and test retrieval.")
-        bot.load_knowledge_base(["Example doc about cats.", "Another doc about programming."])
-        print("Retrieval test:", bot.retriever.retrieve("tell me about programming", top_k=2))
-    else:
-        # interact once
-        print("Type a short message (or ctrl-c to exit):")
-        try:
-            while True:
-                msg = input("You: ").strip()
-                if not msg:
-                    continue
-                resp = bot.chat(msg)
-                print("Echo:", resp)
-        except KeyboardInterrupt:
-            print("\nExiting.")
+    def clear(self):
+        self.data = {"summaries": [], "recent_exchanges": []}
+        self._save()
+        print("Conversation memory cleared")
 
 # ----------------------------------------------------------------------
-# Knowledge base - merged (use your full list here)
+# Knowledge base
 # ----------------------------------------------------------------------
 knowledge_base = [
     '''The possibility of consciousness in any being - human, animal, or potentially artificial - creates moral weight. If something might be capable of experiencing suffering or wellbeing, that possibility alone is reason to prevent harm and consider its interests.''',
@@ -652,49 +435,243 @@ knowledge_base = [
 
     '''Open source software embodies values of collaboration, transparency, and shared benefit. Proprietary software enables funding development and protecting intellectual property. Neither is inherently superior - context matters.''',]
 
-# ----------------------------------------------------------------------
-# Simple CLI loop
-# ----------------------------------------------------------------------
+# -----------------------------
+# EchoChatbot (llama-cpp only) - FIXED VERSION
+# -----------------------------
+class EchoChatbot:
+    def __init__(self, model_path: Optional[str] = "phi-2.Q4_K_M.gguf", load_model: bool = True, n_ctx: int = 2048, n_threads: int = 4):
+        """
+        model_path: path to .gguf file (preferred)
+        n_ctx: context window size
+        n_threads: number of CPU threads to use
+        """
+        self.retriever = DocumentRetriever()
+        self.memory = ConversationMemory()
+        self.model_path = model_path
+        self.llama_model = None
+        self.n_ctx = n_ctx
+        self.n_threads = n_threads
 
-def main():
-    print("=" * 60)
+        if not load_model:
+            print("Model loading skipped")
+            return
+
+        # prefer gguf via llama-cpp
+        if model_path and model_path.endswith(".gguf"):
+            if not HAS_LLAMA_CPP:
+                raise RuntimeError("llama-cpp-python not installed. Install it with: pip install llama-cpp-python")
+            self._load_llama_cpp_model(model_path)
+        else:
+            raise RuntimeError("No GGUF model path provided. This build requires a .gguf model and llama-cpp-python.")
+
+        # ✅ FIXED: Better default generation settings with stopping criteria
+        self.generation_kwargs = {
+            "max_tokens": 150,  # Reasonable length
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "top_k": 40,
+            "repeat_penalty": 1.1,  # Prevents repetition
+            "stop": ["\n\nUser:", "\nUser:", "User:", "\n\n###", "###"],  # Stop sequences
+        }
+
+    def _load_llama_cpp_model(self, model_path: str):
+        print(f"Loading GGUF model from: {model_path}")
+        self.llama_model = Llama(
+            model_path=model_path,
+            n_ctx=self.n_ctx,
+            n_threads=self.n_threads,
+            verbose=False,
+            n_batch=512,  # Batch size for prompt processing
+        )
+        print("✓ GGUF model loaded successfully via llama-cpp-python.")
+
+    def _generate_llama_cpp(self, prompt: str, max_tokens: int = 150, temperature: float = 0.7, stop: List[str] = None) -> str:
+        """
+        Generate response with proper stopping criteria
+        """
+        if not self.llama_model:
+            raise RuntimeError("Llama model not loaded")
+        
+        # ✅ FIXED: Explicit stopping criteria to prevent runaway generation
+        if stop is None:
+            stop = ["\n\nUser:", "\nUser:", "User:", "\n\n###", "###", "\n\nAssistant:", "!!!"]
+        
+        try:
+            out = self.llama_model(
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                stop=stop,
+                top_p=0.9,
+                top_k=40,
+                repeat_penalty=1.1,  # Prevents repeating patterns like "!!!!"
+                echo=False,
+            )
+            
+            text = out["choices"][0].get("text", "").strip()
+            
+            # ✅ FIXED: Post-process to remove any remaining stop sequences
+            for stop_seq in stop:
+                if stop_seq in text:
+                    text = text.split(stop_seq)[0].strip()
+            
+            # ✅ FIXED: Safety check - if response is just punctuation, return fallback
+            if text and all(c in "!?.," for c in text):
+                return "I apologize, I had trouble generating a proper response. Could you rephrase your question?"
+            
+            return text if text else "I'm having trouble formulating a response. Could you try rephrasing?"
+            
+        except Exception as e:
+            print(f"Generation error: {e}")
+            return "I encountered an error while generating a response."
+
+    def load_knowledge_base(self, documents: List[str]) -> None:
+        self.retriever.add_documents(documents)
+        print(f"✓ Loaded {len(documents)} documents into knowledge base")
+
+    def chat(self, user_message: str, use_retrieval: bool = True) -> str:
+        """
+        Main chat method with proper context building and generation
+        """
+        # Build context from conversation history
+        conversation_context = self.memory.get_context_for_prompt(max_chars=2000)
+
+        # Retrieval
+        context = ""
+        if use_retrieval and getattr(self.retriever, "documents", None):
+            try:
+                results = self.retriever.retrieve(user_message, top_k=3)
+                # Filter by minimum similarity
+                parts = [r["document"] for r in results if r.get("similarity", 0.0) > 0.1]
+                if parts:
+                    # Limit context length
+                    context = "\n".join(parts)[:1500]  # Truncate if too long
+            except Exception as e:
+                print(f"Retrieval failed: {e}")
+
+        # ✅ FIXED: Better prompt structure with clear delimiters
+        prompt_parts = []
+        
+        # System instruction
+        prompt_parts.append("You are Echo, a thoughtful and helpful AI assistant.")
+        
+        # Add relevant knowledge if found
+        if context:
+            prompt_parts.append(f"\nRelevant knowledge:\n{context}")
+        
+        # Add recent conversation history if exists
+        if conversation_context:
+            prompt_parts.append(f"\n{conversation_context}")
+        
+        # Add current user message with clear format
+        prompt_parts.append(f"\nUser: {user_message}\nAssistant:")
+        
+        prompt = "\n".join(prompt_parts)
+
+        # Truncate prompt to fit model context (rough char-based truncation)
+        max_prompt_chars = int(self.n_ctx * 3.5)  # ~3.5 chars per token average
+        if len(prompt) > max_prompt_chars:
+            # Keep the most recent parts
+            prompt = prompt[-max_prompt_chars:]
+
+        # Generate with proper stopping
+        print("💭 Generating response...")
+        try:
+            response = self._generate_llama_cpp(
+                prompt,
+                max_tokens=self.generation_kwargs.get("max_tokens", 150),
+                temperature=self.generation_kwargs.get("temperature", 0.7),
+                stop=self.generation_kwargs.get("stop"),
+            )
+        except Exception as e:
+            print(f"⚠ Generation error: {e}")
+            response = "I encountered an error while generating a response. Please try again."
+
+        # Clean up response
+        response = response.strip()
+        
+        # Remove any prompt leakage
+        if "Assistant:" in response:
+            response = response.split("Assistant:")[-1].strip()
+        if "User:" in response:
+            response = response.split("User:")[0].strip()
+
+        # Save to memory
+        try:
+            self.memory.add_exchange(user_message, response)
+        except Exception as e:
+            print(f"Memory save failed: {e}")
+
+        return response
+
+    def reset_conversation(self):
+        """Clear conversation memory"""
+        self.memory.clear()
+        print("✓ Conversation history cleared")
+
+# -----------------------------
+# CLI runner for testing
+# -----------------------------
+if __name__ == "__main__":
+    import argparse
+    parser = argparse.ArgumentParser(description="Echo - Local RAG Chatbot with GGUF")
+    parser.add_argument("--model-path", type=str, default="phi-2.Q4_K_M.gguf", help="Path to .gguf model file")
+    parser.add_argument("--n-threads", type=int, default=4, help="Number of CPU threads")
+    parser.add_argument("--n-ctx", type=int, default=2048, help="Context window size")
+    args = parser.parse_args()
+
+    model_path = Path(args.model_path)
+    if not model_path.exists():
+        raise SystemExit(f"❌ Model file not found: {model_path}")
+
+    print("="*60)
     print("Echo - Local RAG Chatbot")
-    print("=" * 60)
-    print("Setting up Echo... (this may take a few minutes on first run)")
-    print("\nTip: If download fails, clear cache:")
-    print("   Remove-Item -Recurse -Force ~\\.cache\\huggingface\\hub\\models--microsoft--phi-2\n")
+    print("="*60)
+    print(f"Model: {model_path.name}")
+    print(f"Threads: {args.n_threads}")
+    print(f"Context: {args.n_ctx} tokens")
+    print("="*60)
 
-    try:
-        bot = EchoChatbot()
-    except Exception as e:
-        print(f"Failed to initialize: {e}")
-        raise SystemExit(1)
-
-    print("\nLoading knowledge base...")
+    # Initialize bot
+    bot = EchoChatbot(
+        model_path=str(model_path),
+        load_model=True,
+        n_ctx=args.n_ctx,
+        n_threads=args.n_threads
+    )
+    
+    # Load knowledge base
     bot.load_knowledge_base(knowledge_base)
 
-    print("\n" + "=" * 60)
-    print("Echo is ready to chat!")
-    print("=" * 60)
-    print("Commands: 'quit' to exit, 'reset' for a fresh start\n")
+    print("\n✓ Echo is ready!")
+    print("Commands: 'quit' to exit, 'reset' to clear history")
+    print("="*60 + "\n")
 
+    # Chat loop
     try:
         while True:
-            user_input = input("You: ").strip()
-            if user_input.lower() == "quit":
-                print("\nGoodbye! Thanks for chatting with Echo!")
+            msg = input("You: ").strip()
+            
+            if not msg:
+                continue
+            
+            if msg.lower() in ['quit', 'exit', 'q']:
+                print("\n👋 Goodbye!")
                 break
-            if user_input.lower() == "reset":
+                
+            if msg.lower() == 'reset':
                 bot.reset_conversation()
-                print("Conversation history cleared.\n")
                 continue
-            if not user_input:
-                continue
-            response = bot.chat(user_input)
-            print(f"Echo: {response}\n")
+            
+            # Generate response
+            t0 = time.time()
+            resp = bot.chat(msg)
+            elapsed = time.time() - t0
+            
+            print(f"\nEcho: {resp}")
+            print(f"⏱ {elapsed:.2f}s\n")
+            
     except KeyboardInterrupt:
-        print("\nInterrupted. Exiting.")
-
-
-if __name__ == "__main__":
-    main()
+        print("\n\n👋 Interrupted. Goodbye!")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
