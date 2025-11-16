@@ -1,76 +1,67 @@
-# Model files - DO NOT commit (too large for Git)
-*.gguf
-*.bin
-*.safetensors
-*.pt
-*.pth
-
-# Python
 __pycache__/
 *.py[cod]
-*.pyo
-*.pyd
-*.py~ 
-*.swp
-*.egg-info/
-dist/
+*$py.class
+*.so
+.Python
 build/
+develop-eggs/
+dist/
+downloads/
 eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
 *.egg
-pip-wheel-metadata/
-*.log
-.python-version
 
 # Virtual environments
 venv/
-ENV/
 env/
-.env/
-.venv/
-venv.bak/
-venv_*/
-
-# Secrets and config
-.env
-.env.local
-*.env
+ENV/
+.venv
 
 # IDE
 .vscode/
 .idea/
-*.sublime-workspace
-*.sublime-project
-
-# OS files
+*.swp
+*.swo
+*~
 .DS_Store
-Thumbs.db
 
-# Jupyter
-.ipynb_checkpoints
-*.ipynb
-*.nbconvert.ipynb
-profile_default/
-ipython_config.py
+# Model files (too large for git)
+*.gguf
+*.bin
+*.safetensors
+*.pth
+*.pt
 
-# Hugging Face cache
-.cache/
-huggingface/
-
-# Model cache
-models/
-*.model
-
-# Conversation memory
+# Conversation history and cache
 echo_memory.json
+*.json.backup
+.cache/
+_pycache_/
 
-# Streamlit
-.streamlit/
+# Backup files
+*.backup
+*.bak
+*.tmp
 
-# Testing
-.pytest_cache/
-.coverage
-htmlcov/
+# Environment variables
+.env
+.env.local
 
 # Logs
 *.log
 logs/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Streamlit
+.streamlit/secrets.toml

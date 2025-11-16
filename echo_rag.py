@@ -1,6 +1,8 @@
 # echo_llama_only.py
 # Minimal Echo chatbot using llama-cpp-python + GGUF
 # FIXED: Added proper stopping criteria to prevent runaway generation
+# FIXED: Added anti-hallucination measures and response validation
+# FIXED: Proper class structure and indentation
 
 import time
 import json
@@ -436,7 +438,7 @@ knowledge_base = [
     '''Open source software embodies values of collaboration, transparency, and shared benefit. Proprietary software enables funding development and protecting intellectual property. Neither is inherently superior - context matters.''',]
 
 # -----------------------------
-# EchoChatbot (llama-cpp only) - FIXED VERSION
+# EchoChatbot (llama-cpp) with Anti-Hallucination
 # -----------------------------
 class EchoChatbot:
     def __init__(self, model_path: Optional[str] = "phi-2.Q4_K_M.gguf", load_model: bool = True, n_ctx: int = 2048, n_threads: int = 4):
@@ -464,25 +466,39 @@ class EchoChatbot:
         else:
             raise RuntimeError("No GGUF model path provided. This build requires a .gguf model and llama-cpp-python.")
 
-        # ✅ FIXED: Better default generation settings with stopping criteria
+        # Enhanced stop sequences to prevent roleplay/hallucination
         self.generation_kwargs = {
-            "max_tokens": 150,  # Reasonable length
+            "max_tokens": 150,
             "temperature": 0.7,
             "top_p": 0.9,
             "top_k": 40,
-            "repeat_penalty": 1.1,  # Prevents repetition
-            "stop": ["\n\nUser:", "\nUser:", "User:", "\n\n###", "###"],  # Stop sequences
+            "repeat_penalty": 1.1,
+            "stop": [
+                # Standard conversation stops
+                "\n\nUser:", "\nUser:", "User:",
+                "\n\n###", "###",
+                # Roleplay prevention
+                "Rules:", "\nRules:", "Rule:",
+                "1.", "\n1.", "2.", "\n2.",
+                "Think about", "Discuss", "Consider how",
+                "How does", "What impact",
+                "\n\nEcho:", "Echo:",
+                "Instructions:", "Tasks:",
+                "First,", "Second,", "Third,",
+                # Additional safety stops
+                "!!!!", "???", "...",
+            ],
         }
 
     def _load_llama_cpp_model(self, model_path: str):
         print(f"Loading GGUF model from: {model_path}")
         self.llama_model = Llama(
-            model_path=model_path,
-            n_ctx=self.n_ctx,
-            n_threads=self.n_threads,
-            verbose=False,
-            n_batch=512,  # Batch size for prompt processing
+        model_path="mistral-7b-instruct-v0.2.Q4_K_M.gguf",  # Just change this
+        n_ctx=4096,  # Mistral supports bigger context (optional)
+        n_threads=4,
+        verbose=False,
         )
+
         print("✓ GGUF model loaded successfully via llama-cpp-python.")
 
     def _generate_llama_cpp(self, prompt: str, max_tokens: int = 150, temperature: float = 0.7, stop: List[str] = None) -> str:
@@ -492,9 +508,8 @@ class EchoChatbot:
         if not self.llama_model:
             raise RuntimeError("Llama model not loaded")
         
-        # ✅ FIXED: Explicit stopping criteria to prevent runaway generation
         if stop is None:
-            stop = ["\n\nUser:", "\nUser:", "User:", "\n\n###", "###", "\n\nAssistant:", "!!!"]
+            stop = self.generation_kwargs["stop"]
         
         try:
             out = self.llama_model(
@@ -504,18 +519,18 @@ class EchoChatbot:
                 stop=stop,
                 top_p=0.9,
                 top_k=40,
-                repeat_penalty=1.1,  # Prevents repeating patterns like "!!!!"
+                repeat_penalty=1.1,
                 echo=False,
             )
             
             text = out["choices"][0].get("text", "").strip()
             
-            # ✅ FIXED: Post-process to remove any remaining stop sequences
+            # Post-process to remove any remaining stop sequences
             for stop_seq in stop:
                 if stop_seq in text:
                     text = text.split(stop_seq)[0].strip()
             
-            # ✅ FIXED: Safety check - if response is just punctuation, return fallback
+            # Safety check - if response is just punctuation, return fallback
             if text and all(c in "!?.," for c in text):
                 return "I apologize, I had trouble generating a proper response. Could you rephrase your question?"
             
@@ -525,76 +540,171 @@ class EchoChatbot:
             print(f"Generation error: {e}")
             return "I encountered an error while generating a response."
 
+    def _validate_response(self, response: str, user_message: str, prompt: str) -> str:
+        """
+        Filter out hallucinated roleplay content and regenerate if needed
+        """
+        # Detect roleplay/hallucination patterns
+        roleplay_indicators = [
+            "Rules:", "Think about how", "Discuss at least",
+            "provide you with information", "engineer's perspective",
+            "How does this impact", "key areas where",
+            "Consider the following", "Let me explain",
+            "Here are some", "I can help you understand",
+            "From my perspective", "In my opinion",
+        ]
+        
+        # Check if response seems to be inventing tasks/rules
+        has_roleplay = any(indicator.lower() in response.lower() for indicator in roleplay_indicators)
+        
+        # Check for numbered lists when not requested
+        has_unwanted_list = ("1." in response or "2." in response) and not any(
+            word in user_message.lower() for word in ["list", "steps", "enumerate", "number"]
+        )
+        
+        if has_roleplay or has_unwanted_list:
+            print("⚠️ Detected hallucination pattern, regenerating with stricter parameters...")
+            
+            # Create a more direct prompt for regeneration
+            direct_prompt = f"""You are Echo, a helpful AI assistant. 
+            Answer this specific question directly without creating scenarios, rules, or numbered lists:
+
+            Question: {user_message}
+
+            Direct answer:"""
+            
+            # Regenerate with lower temperature for more focused response
+            return self._generate_llama_cpp(
+                prompt=direct_prompt,
+                max_tokens=100,
+                temperature=0.5,
+                stop=self.generation_kwargs["stop"]
+            )
+        
+        return response
+
     def load_knowledge_base(self, documents: List[str]) -> None:
+        """Load documents into the retriever"""
         self.retriever.add_documents(documents)
         print(f"✓ Loaded {len(documents)} documents into knowledge base")
 
+    def _validate_response(self, response: str, user_message: str, prompt: str) -> str:
+        """
+        Filter out hallucinated roleplay content - SIMPLIFIED VERSION
+        """
+        # Detect roleplay/hallucination patterns
+        roleplay_indicators = [
+            "rules:", "think about", "consider",
+            "let me explain", "here are some",
+            "from my perspective", "discuss",
+        ]
+        
+        # Check if response seems to be inventing tasks/rules
+        response_lower = response.lower()
+        has_roleplay = any(indicator in response_lower for indicator in roleplay_indicators)
+        
+        # Check for numbered lists when not requested
+        has_unwanted_list = (
+            ("1." in response or "2." in response or "\n-" in response) 
+            and not any(word in user_message.lower() for word in ["list", "steps", "enumerate", "number"])
+        )
+        
+        # If problematic, truncate at first problem
+        if has_roleplay or has_unwanted_list:
+            print("⚠️ Detected hallucination, truncating...")
+            
+            # Find first occurrence of problem pattern
+            for indicator in ["rules:", "1.", "think about", "consider", "let me"]:
+                if indicator.lower() in response_lower:
+                    pos = response_lower.index(indicator.lower())
+                    # Take everything before the problem, or use fallback
+                    clean = response[:pos].strip()
+                    if len(clean) > 20:  # If we have substantial text before problem
+                        return clean
+            
+            # If we can't salvage, return simple fallback
+            return "I can help with that. Could you provide more details about what you need?"
+        
+        return response
+
     def chat(self, user_message: str, use_retrieval: bool = True) -> str:
         """
-        Main chat method with proper context building and generation
+        Main chat method - ULTRA SIMPLIFIED for code-prone models
         """
-        # Build context from conversation history
-        conversation_context = self.memory.get_context_for_prompt(max_chars=2000)
-
-        # Retrieval
+        # Retrieval with code filtering
         context = ""
         if use_retrieval and getattr(self.retriever, "documents", None):
             try:
-                results = self.retriever.retrieve(user_message, top_k=3)
-                # Filter by minimum similarity
-                parts = [r["document"] for r in results if r.get("similarity", 0.0) > 0.1]
+                results = self.retriever.retrieve(user_message, top_k=2)
+                parts = [r["document"] for r in results if r.get("similarity", 0.0) > 0.15]
                 if parts:
-                    # Limit context length
-                    context = "\n".join(parts)[:1500]  # Truncate if too long
+                    context = " ".join(parts)[:600]  # Shorter context
             except Exception as e:
                 print(f"Retrieval failed: {e}")
 
-        # ✅ FIXED: Better prompt structure with clear delimiters
-        prompt_parts = []
-        
-        # System instruction
-        prompt_parts.append("You are Echo, a thoughtful and helpful AI assistant.")
-        
-        # Add relevant knowledge if found
-        if context:
-            prompt_parts.append(f"\nRelevant knowledge:\n{context}")
-        
-        # Add recent conversation history if exists
-        if conversation_context:
-            prompt_parts.append(f"\n{conversation_context}")
-        
-        # Add current user message with clear format
-        prompt_parts.append(f"\nUser: {user_message}\nAssistant:")
-        
-        prompt = "\n".join(prompt_parts)
+        # Get ONLY the last exchange from conversation (not full history)
+        recent_history = ""
+        if self.memory.data.get("recent_exchanges"):
+            last_exchanges = self.memory.data["recent_exchanges"][-2:]  # Last user + assistant only
+            for ex in last_exchanges:
+                recent_history += f"{ex['content']} "
+            recent_history = recent_history[:300]
 
-        # Truncate prompt to fit model context (rough char-based truncation)
-        max_prompt_chars = int(self.n_ctx * 3.5)  # ~3.5 chars per token average
+        # MISTRAL INSTRUCT FORMAT - Critical for proper behavior
+        prompt = "<s>[INST] You are Echo, a helpful assistant. Answer the user's question directly and naturally.\n\n"
+        
+        if context:
+            prompt += f"Context: {context}\n\n"
+        
+        if recent_history:
+            prompt += f"Previous conversation: {recent_history}\n\n"
+        
+        prompt += f"{user_message} [/INST]"
+
+        # Truncate if needed
+        max_prompt_chars = int(self.n_ctx * 2.5)
         if len(prompt) > max_prompt_chars:
-            # Keep the most recent parts
             prompt = prompt[-max_prompt_chars:]
 
-        # Generate with proper stopping
         print("💭 Generating response...")
         try:
             response = self._generate_llama_cpp(
                 prompt,
-                max_tokens=self.generation_kwargs.get("max_tokens", 150),
-                temperature=self.generation_kwargs.get("temperature", 0.7),
-                stop=self.generation_kwargs.get("stop"),
+                max_tokens=60,  # Even shorter
+                temperature=0.6,
+                stop=["</s>", "[INST]", "[/INST]", "\n\n", "User:", '"""', "```"],
             )
+            
+            # Validate and clean
+            response = self._validate_response(response, user_message, prompt)
+            
         except Exception as e:
             print(f"⚠ Generation error: {e}")
-            response = "I encountered an error while generating a response. Please try again."
+            response = "I encountered an error. Please try again."
 
-        # Clean up response
+        # AGGRESSIVE cleanup for code artifacts
         response = response.strip()
         
-        # Remove any prompt leakage
-        if "Assistant:" in response:
-            response = response.split("Assistant:")[-1].strip()
-        if "User:" in response:
-            response = response.split("User:")[0].strip()
+        # Remove ANY code-like content immediately
+        code_indicators = ['"""', "'''", '```', 'return ', 'def ', 'class ', 'import ', 'Answer:', 'Output:', '{', '}', 'f"', "f'"]
+        for indicator in code_indicators:
+            if indicator in response:
+                response = response.split(indicator)[0].strip()
+        
+        # Remove format markers
+        for marker in ["Assistant:", "User:", "says:", "Background:"]:
+            if marker in response:
+                response = response.split(marker)[0].strip()
+        
+        # Remove trailing incomplete sentences
+        if response and response[-1] not in ".!?":
+            sentences = response.split('.')
+            if len(sentences) > 1:
+                response = '.'.join(sentences[:-1]) + '.'
+        
+        # If response is empty or too short, provide fallback
+        if len(response) < 5:
+            response = "Hello! How can I help you today?"
 
         # Save to memory
         try:
@@ -625,7 +735,7 @@ if __name__ == "__main__":
         raise SystemExit(f"❌ Model file not found: {model_path}")
 
     print("="*60)
-    print("Echo - Local RAG Chatbot")
+    print("Echo - Local RAG Chatbot (Anti-Hallucination Edition)")
     print("="*60)
     print(f"Model: {model_path.name}")
     print(f"Threads: {args.n_threads}")

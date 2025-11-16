@@ -1,4 +1,20 @@
-# Echo - Local RAG Chatbot
+Echo - Local RAG Chatbot
+A local retrieval-augmented generation (RAG) chatbot implementation using quantized language models and CPU-based inference. Echo provides conversational AI capabilities with persistent memory and knowledge retrieval, running entirely offline.
+Features
+
+Local Execution: Runs completely offline using GGUF quantized models via llama-cpp-python
+Retrieval-Augmented Generation: TF-IDF based document retrieval for context-aware responses
+Persistent Memory: Conversation history with automatic summarization
+CPU Optimized: Designed for efficient CPU inference without GPU requirements
+Web Interface: Streamlit-based UI with configurable parameters
+Anti-Hallucination Measures: Prompt engineering and response validation to reduce model hallucination
+
+Requirements
+
+Python 3.8+
+16GB RAM recommended (minimum 8GB)
+CPU with 4+ cores recommended
+Approximately 5GB disk space for model storage
 
 A privacy-first conversational AI that runs entirely on your local machine using GGUF quantized models. No cloud services, no API costs, no data collection.
 
