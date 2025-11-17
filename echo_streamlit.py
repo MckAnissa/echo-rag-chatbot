@@ -68,7 +68,7 @@ with st.sidebar:
                 pass
         st.rerun()
 
-    # Quick debug button to inspect what bot.chat returns (optional)
+    # Quick debug button to inspect what bot.chat returns
     if st.button("DEBUG: inspect bot.chat return"):
         st.session_state._debug_inspect = True
 
@@ -80,7 +80,6 @@ if "bot" not in st.session_state:
     st.session_state.bot = None
     st.session_state.error = None
 
-# Load bot on first run - use fixed params to ensure caching works
 if st.session_state.bot is None:
     with st.spinner("Loading model... This may take a minute on first run."):
         # Use the FULL PATH to the model (change if necessary)
